@@ -1,0 +1,21 @@
+[project]
+name = "ml-engineer-exam"
+version = "0.2.0"
+description = "A sample project for ML engineering exam for Milliman IntelliScript."
+requires-python = ">=3.12"
+dependencies = [
+    "pandas>=3.0.0",
+    "pydantic>=2.12.5",
+    "scikit-learn>=1.8.0",
+]
+
+[project.scripts]
+run_model = "ml_engineer_exam.scripts.run_model:main"
+run_prediction = "ml_engineer_exam.scripts.run_prediction:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.setuptools]
+package-dir = {"ml_engineer" = "src"}
