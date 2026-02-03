@@ -1,17 +1,24 @@
 [project]
 name = "ml-engineer-exam"
-version = "0.2.0"
+version = "0.3.0"
 description = "A sample project for ML engineering exam for Milliman IntelliScript."
 requires-python = ">=3.12"
 dependencies = [
     "loguru>=0.7.3",
     "pandas>=3.0.0",
     "pydantic>=2.12.5",
+    "pytest>=9.0.2",
     "scikit-learn>=1.8.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+]
+
 [project.scripts]
-run_model = "ml_engineer_exam.scripts.run_model:main"
+run_model_training = "ml_engineer_exam.scripts.run_model_training:main"
 run_prediction = "ml_engineer_exam.scripts.run_prediction:main"
 
 [build-system]
@@ -20,3 +27,9 @@ build-backend = "hatchling.build"
 
 [tool.setuptools]
 package-dir = {"ml_engineer" = "src"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
