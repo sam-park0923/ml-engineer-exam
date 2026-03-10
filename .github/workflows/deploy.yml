@@ -1,0 +1,212 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target deployment environment"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  SERVICE_NAME: ml-inference-service
+  CONTAINER_PORT: "8080"
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 1: Run tests before deploying
+  # ─────────────────────────────────────────────────────────────────────────
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Run tests
+        run: uv run pytest -v --tb=short
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 2: Build Docker image and push to ECR
+  # ─────────────────────────────────────────────────────────────────────────
+  build-and-push:
+    name: Build & Push Docker Image
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Determine image tag
+        id: meta
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            IMAGE_TAG="${{ github.ref_name }}"
+          else
+            IMAGE_TAG="sha-$(echo ${{ github.sha }} | cut -c1-7)"
+          fi
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Image tag: ${IMAGE_TAG}"
+
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
+        run: |
+          FULL_IMAGE="${ECR_REGISTRY}/${SERVICE_NAME}:${IMAGE_TAG}"
+          LATEST_IMAGE="${ECR_REGISTRY}/${SERVICE_NAME}:latest"
+
+          docker build \
+            --tag "${FULL_IMAGE}" \
+            --tag "${LATEST_IMAGE}" \
+            --label "git.sha=${{ github.sha }}" \
+            --label "git.ref=${{ github.ref }}" \
+            .
+
+          docker push "${FULL_IMAGE}"
+          docker push "${LATEST_IMAGE}"
+
+          echo "Pushed: ${FULL_IMAGE}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 3: Deploy infrastructure and update ECS service
+  # ─────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to AWS
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event.inputs.environment || 'production' }}
+      url: ${{ steps.get-url.outputs.service_url }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy CloudFormation stack
+        run: |
+          ENVIRONMENT="${{ github.event.inputs.environment || 'production' }}"
+          STACK_NAME="${SERVICE_NAME}-${ENVIRONMENT}"
+          IMAGE_TAG="${{ needs.build-and-push.outputs.image_tag }}"
+
+          aws cloudformation deploy \
+            --template-file infrastructure/cloudformation.yaml \
+            --stack-name "${STACK_NAME}" \
+            --parameter-overrides \
+              EnvironmentName="${ENVIRONMENT}" \
+              ServiceName="${SERVICE_NAME}" \
+              ImageTag="${IMAGE_TAG}" \
+              ContainerPort="${CONTAINER_PORT}" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset
+
+      - name: Wait for ECS service stability
+        run: |
+          ENVIRONMENT="${{ github.event.inputs.environment || 'production' }}"
+          CLUSTER_NAME="${SERVICE_NAME}-cluster"
+
+          aws ecs wait services-stable \
+            --cluster "${CLUSTER_NAME}" \
+            --services "${SERVICE_NAME}" \
+            --region "${AWS_REGION}"
+
+          echo "ECS service is stable."
+
+      - name: Get service URL
+        id: get-url
+        run: |
+          ENVIRONMENT="${{ github.event.inputs.environment || 'production' }}"
+          STACK_NAME="${SERVICE_NAME}-${ENVIRONMENT}"
+
+          SERVICE_URL=$(aws cloudformation describe-stacks \
+            --stack-name "${STACK_NAME}" \
+            --query "Stacks[0].Outputs[?OutputKey=='ServiceUrl'].OutputValue" \
+            --output text)
+
+          echo "service_url=${SERVICE_URL}" >> "$GITHUB_OUTPUT"
+          echo "Service URL: ${SERVICE_URL}"
+
+      - name: Smoke test
+        run: |
+          SERVICE_URL="${{ steps.get-url.outputs.service_url }}"
+          echo "Running smoke test against ${SERVICE_URL}"
+
+          # Wait for the service to be reachable
+          for i in $(seq 1 12); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${SERVICE_URL}/health" || echo "000")
+            if [ "${HTTP_CODE}" = "200" ]; then
+              echo "Health check passed!"
+              break
+            fi
+            echo "Attempt ${i}/12 — HTTP ${HTTP_CODE}, retrying in 10s..."
+            sleep 10
+          done
+
+          # Verify prediction endpoint
+          RESPONSE=$(curl -s -X POST "${SERVICE_URL}/predict" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model_name": "linear",
+              "features": {
+                "MedInc": 1.6812,
+                "HouseAge": 25.0,
+                "AveRooms": 4.192200557103064,
+                "AveBedrms": 1.0222841225626742,
+                "Population": 1392.0,
+                "AveOccup": 3.877437325905293,
+                "Latitude": 36.06,
+                "Longitude": -119.01
+              }
+            }')
+
+          echo "Prediction response: ${RESPONSE}"
+
+          # Validate response contains prediction
+          echo "${RESPONSE}" | python3 -c "
+          import sys, json
+          resp = json.load(sys.stdin)
+          assert 'prediction' in resp, 'Missing prediction in response'
+          print(f'Prediction: {resp[\"prediction\"]:.4f}')
+          "

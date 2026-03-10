@@ -1,0 +1,394 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Milliman IntelliScript ML Inference Service — AWS infrastructure.
+  Deploys an ECS Fargate service behind an Application Load Balancer,
+  with ECR repository for Docker images.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging]
+    Description: Deployment environment name.
+
+  ServiceName:
+    Type: String
+    Default: ml-inference-service
+    Description: Name of the ECS service.
+
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: Docker image tag to deploy.
+
+  ContainerPort:
+    Type: Number
+    Default: 8080
+    Description: Port the container listens on.
+
+  DesiredCount:
+    Type: Number
+    Default: 2
+    Description: Number of ECS tasks to run.
+
+  Cpu:
+    Type: String
+    Default: "512"
+    AllowedValues: ["256", "512", "1024", "2048"]
+    Description: Fargate task CPU units.
+
+  Memory:
+    Type: String
+    Default: "1024"
+    AllowedValues: ["512", "1024", "2048", "4096"]
+    Description: Fargate task memory (MiB).
+
+  VpcCIDR:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC.
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # =========================================================================
+  # ECR Repository
+  # =========================================================================
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${ServiceName}"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # =========================================================================
+  # VPC & Networking
+  # =========================================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ServiceName}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ServiceName}-igw"
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ServiceName}-public-1"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ServiceName}-public-2"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ServiceName}-public-rt"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # =========================================================================
+  # Security Groups
+  # =========================================================================
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP traffic to ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${ServiceName}-alb-sg"
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow traffic from ALB to ECS tasks
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ServiceName}-ecs-sg"
+
+  # =========================================================================
+  # Application Load Balancer
+  # =========================================================================
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ServiceName}-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ServiceName}-tg"
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # =========================================================================
+  # ECS Cluster, Task Definition & Service
+  # =========================================================================
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ServiceName}-cluster"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ServiceName}-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ServiceName}-task-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ServiceName}"
+      RetentionInDays: 30
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ServiceName}"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Sub "${ServiceName}"
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}:${ImageTag}"
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          Environment:
+            - Name: MODELS_DIR
+              Value: /app/data/models
+            - Name: PORT
+              Value: !Sub "${ContainerPort}"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !Sub "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:${ContainerPort}/health')\" || exit 1"
+            Interval: 30
+            Timeout: 10
+            Retries: 3
+            StartPeriod: 15
+
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      ServiceName: !Sub "${ServiceName}"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+      LoadBalancers:
+        - ContainerName: !Sub "${ServiceName}"
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref ALBTargetGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+
+  # =========================================================================
+  # Auto Scaling
+  # =========================================================================
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 6
+      MinCapacity: !Ref DesiredCount
+      ResourceId: !Sub "service/${ECSCluster}/${ECSService.Name}"
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService"
+
+  ScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${ServiceName}-cpu-scaling"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 70.0
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  ECRRepositoryUri:
+    Description: ECR repository URI
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}"
+    Export:
+      Name: !Sub "${ServiceName}-ecr-uri"
+
+  ALBDnsName:
+    Description: Application Load Balancer DNS name (inference endpoint)
+    Value: !GetAtt ALB.DNSName
+    Export:
+      Name: !Sub "${ServiceName}-alb-dns"
+
+  ServiceUrl:
+    Description: Full service URL
+    Value: !Sub "http://${ALB.DNSName}"
+
+  DocsUrl:
+    Description: API documentation URL
+    Value: !Sub "http://${ALB.DNSName}/docs"
+
+  ClusterName:
+    Description: ECS Cluster Name
+    Value: !Ref ECSCluster
+
+  ServiceName:
+    Description: ECS Service Name
+    Value: !Ref ECSService
